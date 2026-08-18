@@ -50,9 +50,14 @@ def _body(placement, model_dir, revision, expect_gb,
           num_samples, prompt_tokens, max_new_tokens):
     """One shape, vLLM runtime. Load, report residency, generate."""
     import os as _os
-    _os.environ["VLLM_LOGGING_LEVEL"] = "WARNING"
     import time
     import torch
+    _os.environ["VLLM_LOGGING_LEVEL"] = "WARNING"
+    if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 10:
+        # Blackwell (sm_100/sm_120): vLLM 0.24 DeepGEMM warmup hits "Unknown
+        # recipe" on this block-scaled FP8 checkpoint (#47130/#47169). Fall
+        # back to CUTLASS/Triton; Ada never reaches DeepGEMM, so it's a no-op there.
+        _os.environ["VLLM_USE_DEEP_GEMM"] = "0"
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
 
