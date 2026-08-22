@@ -6,10 +6,10 @@ labelling and data-url conventions of the transformers-based script; only
 the loader, generate loop and residency semantics differ.
 
 Placement is inapplicable to vLLM (it manages its own memory pool, not
-device_map), so no dmauto/dmgpu0 twin — the placement argument is retained
-as a pass-through label for row continuity with the transformers files.
+device_map). The task-id suffix is the runtime tag "vllm" so rows do not
+collide with the transformers-based dmauto/dmgpu0 sweeps.
 
-Labels: 62 = FP8, n<num_samples>, p<prompt>, o<output>, dm<placement>.
+Labels: 62 = FP8, n<num_samples>, p<prompt>, o<output>, vllm.
 """
 
 import asyncio
@@ -25,7 +25,7 @@ DATA_URL = "hf://models/Qwen/Qwen3.8-27B-FP8/017b9c7"
 DISK_GB = 40
 WAIT_TIMEOUT = 3600
 
-PLACEMENT = "dmgpu0"
+PLACEMENT = "vllm"
 
 
 @client.task(disk_gb=DISK_GB, group_id=GROUP, timeout=120)
@@ -75,9 +75,6 @@ def _body(placement, model_dir, revision, expect_gb,
     t1 = time.monotonic()
     # max_model_len explicit — otherwise vLLM plans a KV pool for the model's
     # full context length and OOMs on Ada 48 GB with a 27.5 GB FP8 checkpoint.
-    # enforce_eager=True — skip CUDA graph capture; FP8 kernel paths on sm_89
-    # for block-scaled checkpoints can fail during capture, and eager mode
-    # also tightens per-call timing variance.
     llm = LLM(
         model=model_dir,
         revision=revision,
@@ -85,7 +82,6 @@ def _body(placement, model_dir, revision, expect_gb,
         tensor_parallel_size=1,
         gpu_memory_utilization=0.90,
         max_model_len=(prompt_tokens or 0) + (max_new_tokens or 0) + 128,
-        enforce_eager=True,
     )
     load_sec = time.monotonic() - t1
     free_after, _ = torch.cuda.mem_get_info()
