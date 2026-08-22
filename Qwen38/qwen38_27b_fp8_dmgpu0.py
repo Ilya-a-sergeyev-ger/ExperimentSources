@@ -52,6 +52,11 @@ def _body(placement, model_dir, revision, expect_gb,
     _os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     import time
     import torch
+    # Hopper (sm_9x): the older transformers in this image feeds UE8M0 scale
+    # factors straight to the pinned deep-gemm fp8_fp4 kernel, which asserts
+    # sfa/sfb are float32. Falls back to Triton via the documented flag.
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
+        _os.environ["TRANSFORMERS_DISABLE_DEEPGEMM_LINEAR"] = "1"
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     for _r, _, _fs in _os.walk(model_dir):

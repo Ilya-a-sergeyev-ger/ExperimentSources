@@ -1,23 +1,29 @@
 """FP8 against BF16 on one host, one session — the precision comparison.
 
-Formed from qwen38_27b_fp8_placed.py and qwen38_27b_bf16_placed.py. Both
-checkpoints share a group_id, so both precisions land on the same worker and
-reuse one /data; provisioning is taken from the BF16 side (vram_gb=80, disk
-sized for ~83 GB of weights) because that is the constraint that has to hold
-for both. Comparing precisions across two machines is what made the earlier
-attempt unreadable: host-to-host spread reached 1.6-1.9x, larger than the
-effect being measured.
+Formed from qwen38_27b_fp8_placed.py and qwen38_27b_bf16_placed.py.
+Comparing precisions across two machines is what made the earlier attempt
+unreadable: host-to-host spread reached 1.6-1.9x, larger than the effect
+being measured, so both precisions must land on the same worker.
 
-What the comparison uses: gen_sec, the generation loop alone. exec_sec cannot
-answer this question -- it also contains the page-cache evict, the tokenizer,
-the weight load (which is itself ~4x longer in FP8) and the prompt build, all
-of them CPU- and IO-bound with the GPU idle.
+One checkpoint on disk at a time. The BF16 arm runs first and downloads
+only the BF16 checkpoint (~56 GB); the FP8 arm then downloads only the
+FP8 checkpoint (~31 GB) — if the worker lacks space, the stale BF16 data
+is evicted (standard worker eviction). Each arm is its own group, so
+group-data reuse stays within the arm and per-arm disk sizing works.
 
-Placement is passed per call, never read from module scope -- a task body ships
-without the module around it. Residency is verified against the VRAM the
-weights actually occupy, not against hf_device_map: with device_map={"": 0}
-transformers leaves that map empty, so counting offloaded entries in it passes
-vacuously.
+What the comparison uses: gen_sec, the generation loop alone. exec_sec
+cannot answer this question -- it also contains the page-cache evict,
+the tokenizer, the weight load (which is itself ~4x longer in FP8) and
+the prompt build, all of them CPU- and IO-bound with the GPU idle.
+
+Placement is passed per call, never read from module scope -- a task
+body ships without the module around it. Residency is verified against
+the VRAM the weights actually occupy, not against hf_device_map: with
+device_map={"": 0} transformers leaves that map empty, so counting
+offloaded entries in it passes vacuously.
+
+Style mirrors qwen38_27b_precision_decode.py: shipped task bodies carry
+literal paths/values, never module constants.
 
 Labels: 62 = FP8, 63 = BF16, then p<prompt tokens>, o<output tokens>,
 dm<device_map value>, as in 18_nw2 / 18_nw2_b128.
@@ -30,22 +36,16 @@ from krauncher import KrauncherClient
 
 client = KrauncherClient()
 
-FP8_ID, FP8_REV, FP8_DIR, FP8_GB = "Qwen/Qwen3.8-27B-FP8", "017b9c7", "/data/Qwen__Qwen3.8-27B-FP8", 27.6
-BF16_ID, BF16_REV, BF16_DIR, BF16_GB = "Qwen/Qwen3.8-27B", "1d4bf0f", "/data/Qwen__Qwen3.8-27B", 55.0
+GROUP_BF16 = f"qwen38-27b-precision-bf16-{uuid.uuid4().hex[:8]}"
+GROUP_FP8 = f"qwen38-27b-precision-fp8-{uuid.uuid4().hex[:8]}"
 
-GROUP = f"qwen38-27b-precision-{uuid.uuid4().hex[:8]}"
-
-VRAM_GB = 80          # BF16 is the binding constraint; FP8 fits trivially
-DISK_GB = 120         # ~83 GB of weights across the two checkpoints, plus room
-
+VRAM_GB = 64          # BF16 is the binding constraint; FP8 fits trivially
+DISK_GB = 64          # one checkpoint at a time: BF16 ~56 GB, FP8 ~31 GB
 PLACEMENT = "dmgpu0"  # "dmauto" | "dmgpu0" | "dmnone"
-
-DATA_URLS = [f"hf://models/{FP8_ID}/{FP8_REV}", f"hf://models/{BF16_ID}/{BF16_REV}"]
-
 WAIT_TIMEOUT = 3600
 
 
-@client.task(vram_gb=VRAM_GB, disk_gb=DISK_GB, group_id=GROUP, timeout=120)
+@client.task(vram_gb=VRAM_GB, disk_gb=DISK_GB, group_id=GROUP_BF16, timeout=120)
 def quick_probe():
     import torch
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -53,17 +53,26 @@ def quick_probe():
     return {"probe_sum": float((x @ x).sum())}
 
 
-@client.task(vram_gb=VRAM_GB, group_id=GROUP, data_urls=DATA_URLS,
+@client.task(vram_gb=VRAM_GB, group_id=GROUP_BF16,
+             data_urls=["hf://models/Qwen/Qwen3.8-27B/1d4bf0f"],
              timeout=3000, dataset_size=0, disk_gb=DISK_GB, stream_stderr=True)
-def warmup():
-    """Pays the one-off download of both checkpoints. Not a measurement point."""
+def warmup_bf16():
+    """Pays the one-off download of the BF16 checkpoint. Not a measurement point."""
     import os
-    seen = {}
-    for d in ("/data/Qwen__Qwen3.8-27B-FP8", "/data/Qwen__Qwen3.8-27B"):
-        n = sum(os.path.getsize(os.path.join(r, f))
-                for r, _, fs in os.walk(d) for f in fs)
-        seen[d] = round(n / 2**30, 2)
-    return {"downloaded_gb": seen}
+    n = sum(os.path.getsize(os.path.join(r, f))
+            for r, _, fs in os.walk("/data/Qwen__Qwen3.8-27B") for f in fs)
+    return {"downloaded_gb": round(n / 2**30, 2)}
+
+
+@client.task(vram_gb=VRAM_GB, group_id=GROUP_FP8,
+             data_urls=["hf://models/Qwen/Qwen3.8-27B-FP8/017b9c7"],
+             timeout=3000, dataset_size=0, disk_gb=DISK_GB, stream_stderr=True)
+def warmup_fp8():
+    """Pays the one-off download of the FP8 checkpoint. Not a measurement point."""
+    import os
+    n = sum(os.path.getsize(os.path.join(r, f))
+            for r, _, fs in os.walk("/data/Qwen__Qwen3.8-27B-FP8") for f in fs)
+    return {"downloaded_gb": round(n / 2**30, 2)}
 
 
 def _body(placement, model_dir, revision, expect_gb,
@@ -73,6 +82,11 @@ def _body(placement, model_dir, revision, expect_gb,
     import os as _os
     import time
     import torch
+    # Hopper (sm_9x): the older transformers in this image feeds UE8M0 scale
+    # factors straight to the pinned deep-gemm fp8_fp4 kernel, which asserts
+    # sfa/sfb are float32. Falls back to Triton via the documented flag.
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
+        _os.environ["TRANSFORMERS_DISABLE_DEEPGEMM_LINEAR"] = "1"
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     for _r, _, _fs in _os.walk(model_dir):
@@ -144,42 +158,51 @@ def _body(placement, model_dir, revision, expect_gb,
             "out_tokens_per_sec": round(num_samples * max_new_tokens / gen_sec, 2)}
 
 
-def _task(fn):
-    return client.task(vram_gb=VRAM_GB, group_id=GROUP, data_urls=DATA_URLS,
-                       timeout=3000, dataset_size=0, disk_gb=DISK_GB,
-                       stream_stderr=True)(fn)
+def _task(*, group_id, data_url):
+    """Decorator factory — group and data_url vary per precision arm. Applied
+    client-side only; the shipped task body never references module state."""
+    def _decorate(fn):
+        return client.task(vram_gb=VRAM_GB, group_id=group_id,
+                           data_urls=[data_url], timeout=3000, dataset_size=0,
+                           disk_gb=DISK_GB, stream_stderr=True)(fn)
+    return _decorate
 
 
-@_task
-def fp8_load(placement: str = "dmauto"):
-    return _body(placement, "/data/Qwen__Qwen3.8-27B-FP8", "017b9c7", 27.6, 0, 0, 0)
-
-
-@_task
-def fp8_shape(placement: str = "dmauto", num_samples: int = 5,
-              prompt_tokens: int = 256, max_new_tokens: int = 1024):
-    return _body(placement, "/data/Qwen__Qwen3.8-27B-FP8", "017b9c7", 27.6,
-                 num_samples, prompt_tokens, max_new_tokens)
-
-
-@_task
+@_task(group_id=GROUP_BF16, data_url="hf://models/Qwen/Qwen3.8-27B/1d4bf0f")
 def bf16_load(placement: str = "dmauto"):
     return _body(placement, "/data/Qwen__Qwen3.8-27B", "1d4bf0f", 55.0, 0, 0, 0)
 
 
-@_task
+@_task(group_id=GROUP_BF16, data_url="hf://models/Qwen/Qwen3.8-27B/1d4bf0f")
 def bf16_shape(placement: str = "dmauto", num_samples: int = 5,
                prompt_tokens: int = 256, max_new_tokens: int = 1024):
     return _body(placement, "/data/Qwen__Qwen3.8-27B", "1d4bf0f", 55.0,
                  num_samples, prompt_tokens, max_new_tokens)
 
 
+@_task(group_id=GROUP_FP8, data_url="hf://models/Qwen/Qwen3.8-27B-FP8/017b9c7")
+def fp8_load(placement: str = "dmauto"):
+    return _body(placement, "/data/Qwen__Qwen3.8-27B-FP8", "017b9c7", 27.6, 0, 0, 0)
+
+
+@_task(group_id=GROUP_FP8, data_url="hf://models/Qwen/Qwen3.8-27B-FP8/017b9c7")
+def fp8_shape(placement: str = "dmauto", num_samples: int = 5,
+              prompt_tokens: int = 256, max_new_tokens: int = 1024):
+    return _body(placement, "/data/Qwen__Qwen3.8-27B-FP8", "017b9c7", 27.6,
+                 num_samples, prompt_tokens, max_new_tokens)
+
+
 SHAPES = [
-    (5, 256, 1024),
-    (5, 8192, 128),
-    (10, 1024, 128),
-    (10, 4096, 128),
+    (5,   256, 1024),
+    (5,  8192,  128),
+    (10, 1024,  128),
+    (10, 4096,  128),
     (10, 16384, 128),
+    (2,   256, 1024),
+    (2,  8192,  128),
+    (2,  1024,  128),
+    (2,  4096,  128),
+    (2,  16384, 128),
 ]
 
 
@@ -203,19 +226,25 @@ async def main():
     if not client.api_key:
         print("ERROR: Set CAS_API_KEY in .env (run seed_api_key.py first)")
         return
-    print(f"Group: {GROUP}   placement={PLACEMENT}")
-    print(f"FP8:  {FP8_ID} @ {FP8_REV}")
-    print(f"BF16: {BF16_ID} @ {BF16_REV}")
+    print(f"Group BF16: {GROUP_BF16}   Group FP8: {GROUP_FP8}   placement={PLACEMENT}")
+    print("FP8:  Qwen/Qwen3.8-27B-FP8 @ 017b9c7")
+    print("BF16: Qwen/Qwen3.8-27B @ 1d4bf0f")
     print("=" * 100)
     await _run("probe", quick_probe())
-    await _run("warmup", warmup())
-    for base, load_fn, shape_fn in (("62", fp8_load, fp8_shape),
-                                    ("63", bf16_load, bf16_shape)):
-        await _run(f"{base}_load_{PLACEMENT}", load_fn(placement=PLACEMENT))
-        for n, p, o in SHAPES:
-            await _run(f"{base}_p{p}_o{o}_{PLACEMENT}",
-                       shape_fn(placement=PLACEMENT, num_samples=n,
-                                prompt_tokens=p, max_new_tokens=o))
+    # BF16 arm first (heavier checkpoint); FP8 arm second so the worker can
+    # evict the BF16 data if it's tight on disk.
+    await _run("warmup_bf16", warmup_bf16())
+    await _run(f"63_load_{PLACEMENT}", bf16_load(placement=PLACEMENT))
+    for n, p, o in SHAPES:
+        await _run(f"63_n{n}_p{p}_o{o}_{PLACEMENT}",
+                   bf16_shape(placement=PLACEMENT, num_samples=n,
+                              prompt_tokens=p, max_new_tokens=o))
+    await _run("warmup_fp8", warmup_fp8())
+    await _run(f"62_load_{PLACEMENT}", fp8_load(placement=PLACEMENT))
+    for n, p, o in SHAPES:
+        await _run(f"62_n{n}_p{p}_o{o}_{PLACEMENT}",
+                   fp8_shape(placement=PLACEMENT, num_samples=n,
+                             prompt_tokens=p, max_new_tokens=o))
 
 
 if __name__ == "__main__":
