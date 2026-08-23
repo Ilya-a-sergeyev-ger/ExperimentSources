@@ -10,6 +10,7 @@ Labels: 62 = FP8, n<num_samples>, p<prompt>, o<output>, dm<placement>.
 """
 
 import asyncio
+import os
 import uuid
 
 from krauncher import KrauncherClient
@@ -20,12 +21,15 @@ GROUP = f"qwen38-27b-fp8-placement-{uuid.uuid4().hex[:8]}"
 DATA_URL = "hf://models/Qwen/Qwen3.8-27B-FP8/017b9c7"
 
 DISK_GB = 40
+# Explicit per-task pin: env-var pick-up applies only to the first task.
+GPU_NAME = os.environ.get("KRAUNCHER_GPU_NAME", "")
 WAIT_TIMEOUT = 3600
 
 PLACEMENT = "dmgpu0"
 
 
-@client.task(disk_gb=DISK_GB, group_id=GROUP, timeout=120)
+@client.task(disk_gb=DISK_GB, gpu_name=GPU_NAME,
+             group_id=GROUP, timeout=120)
 def quick_probe():
     import torch
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -34,7 +38,8 @@ def quick_probe():
 
 
 @client.task(group_id=GROUP, data_urls=[DATA_URL], timeout=2400,
-             dataset_size=0, disk_gb=DISK_GB, stream_stderr=True)
+             dataset_size=0, disk_gb=DISK_GB, gpu_name=GPU_NAME,
+             stream_stderr=True)
 def warmup():
     """Pays the one-off download of the FP8 checkpoint. Not a measurement point."""
     import os
@@ -117,7 +122,8 @@ def _body(placement, model_dir, revision, expect_gb,
 
 def _task(fn):
     return client.task(group_id=GROUP, data_urls=[DATA_URL], timeout=3000,
-                       dataset_size=0, disk_gb=DISK_GB, stream_stderr=True)(fn)
+                       dataset_size=0, disk_gb=DISK_GB, gpu_name=GPU_NAME,
+                       stream_stderr=True)(fn)
 
 
 @_task

@@ -30,6 +30,7 @@ dm<device_map value>, as in 18_nw2 / 18_nw2_b128.
 """
 
 import asyncio
+import os
 import uuid
 
 from krauncher import KrauncherClient
@@ -42,10 +43,13 @@ GROUP_FP8 = f"qwen38-27b-precision-fp8-{uuid.uuid4().hex[:8]}"
 VRAM_GB = 64          # BF16 is the binding constraint; FP8 fits trivially
 DISK_GB = 64          # one checkpoint at a time: BF16 ~56 GB, FP8 ~31 GB
 PLACEMENT = "dmgpu0"  # "dmauto" | "dmgpu0" | "dmnone"
+# Explicit per-task pin: env-var pick-up applies only to the first task.
+GPU_NAME = os.environ.get("KRAUNCHER_GPU_NAME", "")
 WAIT_TIMEOUT = 3600
 
 
-@client.task(vram_gb=VRAM_GB, disk_gb=DISK_GB, group_id=GROUP_BF16, timeout=120)
+@client.task(vram_gb=VRAM_GB, disk_gb=DISK_GB, gpu_name=GPU_NAME,
+             group_id=GROUP_BF16, timeout=120)
 def quick_probe():
     import torch
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -53,7 +57,7 @@ def quick_probe():
     return {"probe_sum": float((x @ x).sum())}
 
 
-@client.task(vram_gb=VRAM_GB, group_id=GROUP_BF16,
+@client.task(vram_gb=VRAM_GB, group_id=GROUP_BF16, gpu_name=GPU_NAME,
              data_urls=["hf://models/Qwen/Qwen3.8-27B/1d4bf0f"],
              timeout=3000, dataset_size=0, disk_gb=DISK_GB, stream_stderr=True)
 def warmup_bf16():
@@ -64,7 +68,7 @@ def warmup_bf16():
     return {"downloaded_gb": round(n / 2**30, 2)}
 
 
-@client.task(vram_gb=VRAM_GB, group_id=GROUP_FP8,
+@client.task(vram_gb=VRAM_GB, group_id=GROUP_FP8, gpu_name=GPU_NAME,
              data_urls=["hf://models/Qwen/Qwen3.8-27B-FP8/017b9c7"],
              timeout=3000, dataset_size=0, disk_gb=DISK_GB, stream_stderr=True)
 def warmup_fp8():
@@ -80,6 +84,8 @@ def _body(placement, model_dir, revision, expect_gb,
     """One precision, one shape, one placement. Load, verify, generate."""
     from collections import Counter
     import os as _os
+    # Reclaim allocator fragmentation so long prefills fit in 32 GB.
+    _os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     import time
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -158,7 +164,8 @@ def _task(*, group_id, data_url):
     client-side only; the shipped task body never references module state."""
     def _decorate(fn):
         return client.task(vram_gb=VRAM_GB, group_id=group_id,
-                           data_urls=[data_url], timeout=3000, dataset_size=0,
+                           gpu_name=GPU_NAME, data_urls=[data_url],
+                           timeout=3000, dataset_size=0,
                            disk_gb=DISK_GB, stream_stderr=True)(fn)
     return _decorate
 

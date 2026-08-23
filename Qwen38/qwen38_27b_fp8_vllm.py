@@ -13,6 +13,7 @@ Labels: 62 = FP8, n<num_samples>, p<prompt>, o<output>, vllm.
 """
 
 import asyncio
+import os
 import uuid
 
 from krauncher import KrauncherClient
@@ -23,12 +24,15 @@ GROUP = f"qwen38-27b-fp8-vllm-{uuid.uuid4().hex[:8]}"
 DATA_URL = "hf://models/Qwen/Qwen3.8-27B-FP8/017b9c7"
 
 DISK_GB = 40
+# Explicit per-task pin: env-var pick-up applies only to the first task.
+GPU_NAME = os.environ.get("KRAUNCHER_GPU_NAME", "")
 WAIT_TIMEOUT = 3600
 
 PLACEMENT = "vllm"
 
 
-@client.task(disk_gb=DISK_GB, group_id=GROUP, timeout=120)
+@client.task(disk_gb=DISK_GB, gpu_name=GPU_NAME,
+             group_id=GROUP, timeout=120)
 def quick_probe():
     import torch
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -37,7 +41,8 @@ def quick_probe():
 
 
 @client.task(group_id=GROUP, data_urls=[DATA_URL], timeout=2400,
-             dataset_size=0, disk_gb=DISK_GB, stream_stderr=True)
+             dataset_size=0, disk_gb=DISK_GB, gpu_name=GPU_NAME,
+             stream_stderr=True)
 def warmup():
     """Pays the one-off download of the FP8 checkpoint. Not a measurement point."""
     import os
@@ -75,14 +80,20 @@ def _body(placement, model_dir, revision, expect_gb,
     t1 = time.monotonic()
     # max_model_len explicit — otherwise vLLM plans a KV pool for the model's
     # full context length and OOMs on Ada 48 GB with a 27.5 GB FP8 checkpoint.
-    llm = LLM(
+    llm_kwargs = dict(
         model=model_dir,
         revision=revision,
         dtype="auto",
         tensor_parallel_size=1,
-        gpu_memory_utilization=0.90,
+        gpu_memory_utilization=0.9,
         max_model_len=(prompt_tokens or 0) + (max_new_tokens or 0) + 128,
+        gdn_prefill_backend="triton",
     )
+    # On Hopper (sm_90) the default max_num_seqs=1024 exceeds the Mamba cache
+    # blocks CUDA-graph capture needs; cap it to a moderate value there.
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
+        llm_kwargs["max_num_seqs"] = 512
+    llm = LLM(**llm_kwargs)
     load_sec = time.monotonic() - t1
     free_after, _ = torch.cuda.mem_get_info()
     on_gpu_gb = (free_before - free_after) / 2**30
@@ -126,7 +137,8 @@ def _body(placement, model_dir, revision, expect_gb,
 
 def _task(fn):
     return client.task(group_id=GROUP, data_urls=[DATA_URL], timeout=3000,
-                       dataset_size=0, disk_gb=DISK_GB, stream_stderr=True)(fn)
+                       dataset_size=0, disk_gb=DISK_GB, gpu_name=GPU_NAME,
+                       stream_stderr=True)(fn)
 
 
 @_task
