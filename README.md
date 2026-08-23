@@ -27,3 +27,17 @@ python Qwen38/qwen38_27b_fp8_dmgpu0.py
 
 Each scenario prints one line per point: worker, GPU type, download time, compute
 time, `actual_cu`, and the result dict.
+
+## Transformers patches
+
+Running Qwen3.8 FP8 on Hopper (sm_90) needs two fixes on top of upstream
+`transformers`. Both branches are applied in the krauncher worker image, so the
+scenarios above use them transparently.
+
+- [`fix-deepgemm-sm90-non-fp32-scales`](https://github.com/Ilya-a-sergeyev-ger/transformers/commits/fix-deepgemm-sm90-non-fp32-scales/)
+  — universal FP32 upcast of block-scaled FP8 weight scales on SM90 (DeepGEMM
+  path). Without it the model loads but the first forward errors on UE8M0
+  scales packed as int32.
+- [`fix-fp8-should-convert-prefix-match`](https://github.com/Ilya-a-sergeyev-ger/transformers/tree/fix-fp8-should-convert-prefix-match)
+  — literal prefix matching in `should_convert_module`, replacing a fragile
+  regex that skipped the wrong modules for this checkpoint.
